@@ -6,6 +6,8 @@ import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -20,7 +22,7 @@ import kotlin.math.sqrt
 
 class TouchService : AccessibilityService() {
 
-    private enum class Tipo { TOQUE, SEGURAR, JOYSTICK }
+    private enum class Tipo { TOQUE, SEGURAR, JOYSTICK, CAMERA }
 
     private class Def(
         val id: Int,
@@ -41,9 +43,11 @@ class TouchService : AccessibilityService() {
     )
 
     private val JOY_ID = -1
+    private val CAM_ID = -2
 
     private val defs = listOf(
         Def(JOY_ID, "WASD - Andar (joystick)", "WASD\nAndar", Tipo.JOYSTICK, 0.15f, 0.65f, 120),
+        Def(CAM_ID, "Mouse - Câmera (área de giro)", "CÂMERA", Tipo.CAMERA, 0.62f, 0.35f, 180),
         Def(KeyEvent.KEYCODE_K, "K - Tiro (segura)", "K\nTiro", Tipo.SEGURAR, 0.85f, 0.55f, 68),
         Def(KeyEvent.KEYCODE_SPACE, "Espaço - Pular", "Espaço\nPular", Tipo.TOQUE, 0.92f, 0.40f, 64),
         Def(KeyEvent.KEYCODE_C, "C - Agachar", "C\nAgachar", Tipo.TOQUE, 0.92f, 0.70f, 64),
@@ -59,6 +63,7 @@ class TouchService : AccessibilityService() {
 
     private lateinit var wm: WindowManager
     private lateinit var prefs: SharedPreferences
+    private val handler = Handler(Looper.getMainLooper())
 
     private val ativos = LinkedHashMap<Int, Ativo>()
     private var selecionado: Ativo? = null
@@ -68,6 +73,9 @@ class TouchService : AccessibilityService() {
     private var btnMenos: TextView? = null
     private var btnMais: TextView? = null
     private var btnRemover: TextView? = null
+    private var btnSensMenos: TextView? = null
+    private var btnSensMais: TextView? = null
+    private var btnMouse: TextView? = null
     private var painel: ScrollView? = null
 
     private var modoEdicao = false
@@ -79,12 +87,37 @@ class TouchService : AccessibilityService() {
     private var dir = false
     private var joyAtivo = false
 
+    // mouse
+    private var capView: View? = null
+    private var capturando = false
+    private var temCaptura = false
+    private var botaoEsq = false
+    private var camAtiva = false
+    private var offX = 0f
+    private var offY = 0f
+    private var sens = 1.5f
+    private val soltarCamRun = Runnable { soltarCam() }
+
+    private inner class CapView(ctx: Context) : View(ctx) {
+        override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+            super.onWindowFocusChanged(hasWindowFocus)
+            if (hasWindowFocus && capturando) requestPointerCapture()
+        }
+
+        override fun onPointerCaptureChange(hasCapture: Boolean) {
+            super.onPointerCaptureChange(hasCapture)
+            temCaptura = hasCapture
+            atualizarBarra()
+        }
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         if (criado) return
         criado = true
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         prefs = getSharedPreferences("mapeador", Context.MODE_PRIVATE)
+        sens = prefs.getFloat("sens", 1.5f)
         criarBarra()
         for (def in defs) {
             if (prefs.getBoolean("on_${def.id}", false)) adicionar(def)
@@ -101,10 +134,11 @@ class TouchService : AccessibilityService() {
     private fun pill(texto: String, acao: () -> Unit): TextView {
         return TextView(this).apply {
             text = texto
-            textSize = 12f
+            textSize = 11f
+            isSingleLine = true
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
-            setPadding(28, 12, 28, 12)
+            setPadding(24, 12, 24, 12)
             background = GradientDrawable().apply {
                 cornerRadius = 40f
                 setColor(Color.parseColor("#CC000000"))
@@ -121,11 +155,14 @@ class TouchService : AccessibilityService() {
         val mm = pill("−") { redimensionar(-8) }
         val mp = pill("+") { redimensionar(8) }
         val mr = pill("REMOVER") { remover() }
-        for (v in listOf(mb, ma, mm, mp, mr)) {
+        val sm = pill("SENS −") { ajustarSens(-0.25f) }
+        val sp = pill("SENS +") { ajustarSens(0.25f) }
+        val mo = pill("MOUSE: OFF") { alternarCaptura() }
+        for (v in listOf(mb, ma, mm, mp, mr, sm, sp, mo)) {
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(6, 0, 6, 0) }
+            ).apply { setMargins(5, 0, 5, 0) }
             b.addView(v, lp)
         }
         val wlp = WindowManager.LayoutParams(
@@ -145,16 +182,30 @@ class TouchService : AccessibilityService() {
         btnMenos = mm
         btnMais = mp
         btnRemover = mr
+        btnSensMenos = sm
+        btnSensMais = sp
+        btnMouse = mo
     }
 
     private fun atualizarBarra() {
         btnModo?.text = if (modoEdicao) "JOGAR" else "EDITAR"
         barra?.alpha = if (modoEdicao) 0.95f else 0.5f
         btnAdd?.visibility = if (modoEdicao) View.VISIBLE else View.GONE
-        val vis = if (modoEdicao && selecionado != null) View.VISIBLE else View.GONE
+        val sel = selecionado
+        val vis = if (modoEdicao && sel != null) View.VISIBLE else View.GONE
         btnMenos?.visibility = vis
         btnMais?.visibility = vis
         btnRemover?.visibility = vis
+        val visSens =
+            if (modoEdicao && sel?.def?.tipo == Tipo.CAMERA) View.VISIBLE else View.GONE
+        btnSensMenos?.visibility = visSens
+        btnSensMais?.visibility = visSens
+        btnMouse?.visibility = if (modoEdicao) View.GONE else View.VISIBLE
+        btnMouse?.text = when {
+            !capturando -> "MOUSE: OFF"
+            temCaptura -> "MOUSE: ON"
+            else -> "MOUSE: AGUARDA"
+        }
     }
 
     private fun abrirPainel() {
@@ -257,7 +308,11 @@ class TouchService : AccessibilityService() {
         val alt = minOf(d.widthPixels, d.heightPixels)
         val dp = prefs.getInt("s_${def.id}", def.dpPadrao)
         val tam = (dp * d.density).toInt()
-        val cor = if (def.tipo == Tipo.JOYSTICK) "#CC2E7D32" else "#CC1565C0"
+        val cor = when (def.tipo) {
+            Tipo.JOYSTICK -> "#CC2E7D32"
+            Tipo.CAMERA -> "#996A1B9A"
+            else -> "#CC1565C0"
+        }
 
         val fundo = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
@@ -331,7 +386,7 @@ class TouchService : AccessibilityService() {
     private fun redimensionar(delta: Int) {
         val a = selecionado ?: return
         val dens = resources.displayMetrics.density
-        val novoDp = (a.dp + delta).coerceIn(32, 240)
+        val novoDp = (a.dp + delta).coerceIn(32, 320)
         if (novoDp == a.dp) return
         val antigo = a.params.width
         val novo = (novoDp * dens).toInt()
@@ -355,6 +410,7 @@ class TouchService : AccessibilityService() {
             esq = false
             dir = false
         }
+        if (a.def.id == CAM_ID) soltarCam()
         try { wm.removeView(a.view) } catch (e: Exception) {}
         ativos.remove(a.def.id)
         prefs.edit().putBoolean("on_${a.def.id}", false).apply()
@@ -368,7 +424,7 @@ class TouchService : AccessibilityService() {
             a.view.alpha = 0.9f
         } else {
             a.params.flags = flagsBase or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-            a.view.alpha = 0.3f
+            a.view.alpha = if (a.def.tipo == Tipo.CAMERA) 0.12f else 0.3f
         }
         wm.updateViewLayout(a.view, a.params)
     }
@@ -385,6 +441,7 @@ class TouchService : AccessibilityService() {
     private fun alternarModo() {
         modoEdicao = !modoEdicao
         if (modoEdicao) {
+            desligarCaptura()
             soltarTudo()
         } else {
             val msg = Toques.preparar()
@@ -401,7 +458,130 @@ class TouchService : AccessibilityService() {
         esq = false
         dir = false
         joyAtivo = false
+        soltarCam()
         Toques.soltarTudo()
+    }
+
+    private fun ajustarSens(delta: Float) {
+        sens = (sens + delta).coerceIn(0.25f, 6f)
+        prefs.edit().putFloat("sens", sens).apply()
+        Toast.makeText(this, "Sensibilidade: " + "%.2f".format(sens), Toast.LENGTH_SHORT).show()
+    }
+
+    // ---------- mouse ----------
+
+    private fun alternarCaptura() {
+        if (modoEdicao) return
+        if (capturando) desligarCaptura() else ligarCaptura()
+    }
+
+    private fun ligarCaptura() {
+        if (capView != null) return
+        capturando = true
+        val v = CapView(this)
+        v.isFocusable = true
+        v.isFocusableInTouchMode = true
+        v.setOnCapturedPointerListener { _, ev ->
+            tratarMouse(ev)
+            true
+        }
+        val lp = WindowManager.LayoutParams(
+            1, 1,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+        wm.addView(v, lp)
+        capView = v
+        v.requestFocus()
+        atualizarBarra()
+        handler.postDelayed({ capView?.requestPointerCapture() }, 300)
+        handler.postDelayed({
+            if (capturando && !temCaptura) {
+                Toast.makeText(
+                    this,
+                    "Mapeador: o Android não liberou a captura do mouse.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }, 1500)
+    }
+
+    private fun desligarCaptura() {
+        capturando = false
+        temCaptura = false
+        soltarCam()
+        if (botaoEsq) {
+            botaoEsq = false
+            atirarMouse(false)
+        }
+        capView?.let {
+            try { it.releasePointerCapture() } catch (e: Exception) {}
+            try { wm.removeView(it) } catch (e: Exception) {}
+        }
+        capView = null
+        atualizarBarra()
+    }
+
+    private fun tratarMouse(ev: MotionEvent) {
+        val esquerdo = (ev.buttonState and MotionEvent.BUTTON_PRIMARY) != 0
+        if (esquerdo != botaoEsq) {
+            botaoEsq = esquerdo
+            atirarMouse(esquerdo)
+        }
+        val acao = ev.actionMasked
+        if (acao == MotionEvent.ACTION_MOVE || acao == MotionEvent.ACTION_HOVER_MOVE) {
+            var dx = ev.x
+            var dy = ev.y
+            for (i in 0 until ev.historySize) {
+                dx += ev.getHistoricalX(i)
+                dy += ev.getHistoricalY(i)
+            }
+            moverCamera(dx, dy)
+        }
+    }
+
+    private fun atirarMouse(down: Boolean) {
+        val a = ativos[KeyEvent.KEYCODE_K] ?: return
+        val c = centro(a)
+        if (down) Toques.descer(KeyEvent.KEYCODE_K, c.first, c.second)
+        else Toques.subir(KeyEvent.KEYCODE_K)
+    }
+
+    private fun moverCamera(dx: Float, dy: Float) {
+        val cam = ativos[CAM_ID] ?: return
+        val c = centro(cam)
+        val raio = cam.view.width / 2f * 0.85f
+
+        if (!camAtiva) {
+            Toques.descer(CAM_ID, c.first, c.second)
+            camAtiva = true
+            offX = 0f
+            offY = 0f
+        }
+        offX += dx * sens
+        offY += dy * sens
+        val len = sqrt(offX * offX + offY * offY)
+        if (len > raio) {
+            Toques.subir(CAM_ID)
+            Toques.descer(CAM_ID, c.first, c.second)
+            offX = 0f
+            offY = 0f
+        } else {
+            Toques.mover(CAM_ID, c.first + offX, c.second + offY)
+        }
+        handler.removeCallbacks(soltarCamRun)
+        handler.postDelayed(soltarCamRun, 120)
+    }
+
+    private fun soltarCam() {
+        handler.removeCallbacks(soltarCamRun)
+        if (camAtiva) {
+            Toques.subir(CAM_ID)
+            camAtiva = false
+        }
     }
 
     // ---------- teclado ----------
@@ -415,6 +595,10 @@ class TouchService : AccessibilityService() {
 
         if (event.keyCode == KeyEvent.KEYCODE_F1) {
             if (down && event.repeatCount == 0) alternarModo()
+            return true
+        }
+        if (event.keyCode == KeyEvent.KEYCODE_F2) {
+            if (down && event.repeatCount == 0) alternarCaptura()
             return true
         }
         if (modoEdicao) return false
@@ -435,7 +619,7 @@ class TouchService : AccessibilityService() {
         }
 
         val a = ativos[event.keyCode] ?: return false
-        if (a.def.tipo == Tipo.JOYSTICK) return false
+        if (a.def.tipo == Tipo.JOYSTICK || a.def.tipo == Tipo.CAMERA) return false
         if (event.repeatCount > 0) return true
         val c = centro(a)
 
@@ -485,6 +669,7 @@ class TouchService : AccessibilityService() {
 
     override fun onDestroy() {
         if (criado) {
+            desligarCaptura()
             Toques.soltarTudo()
             fecharPainel()
             for (a in ativos.values) {
