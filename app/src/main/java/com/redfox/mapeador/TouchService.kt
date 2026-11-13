@@ -27,11 +27,12 @@ class TouchService : AccessibilityService() {
     private class Def(
         val id: Int,
         val nome: String,
-        val rotulo: String,
+        val titulo: String,
         val tipo: Tipo,
         val xPadrao: Float,
         val yPadrao: Float,
-        val dpPadrao: Int
+        val dpPadrao: Int,
+        val teclaPadrao: Int
     )
 
     private class Ativo(
@@ -44,17 +45,26 @@ class TouchService : AccessibilityService() {
 
     private val JOY_ID = -1
     private val CAM_ID = -2
+    private val TIRO_ID = KeyEvent.KEYCODE_K
+    private val DROP_ID = 1001
+    private val IDLE_MS = 350L
 
+    // Os ids antigos (iguais aos keycodes) foram mantidos para não perder
+    // as posições salvas. A tecla de cada botão agora é separada do id.
     private val defs = listOf(
-        Def(JOY_ID, "WASD - Andar (joystick)", "WASD\nAndar", Tipo.JOYSTICK, 0.15f, 0.65f, 120),
-        Def(CAM_ID, "Mouse - Câmera (área de giro)", "CÂMERA", Tipo.CAMERA, 0.62f, 0.35f, 180),
-        Def(KeyEvent.KEYCODE_K, "K - Tiro (segura)", "K\nTiro", Tipo.SEGURAR, 0.85f, 0.55f, 68),
-        Def(KeyEvent.KEYCODE_SPACE, "Espaço - Pular", "Espaço\nPular", Tipo.TOQUE, 0.92f, 0.40f, 64),
-        Def(KeyEvent.KEYCODE_C, "C - Agachar", "C\nAgachar", Tipo.TOQUE, 0.92f, 0.70f, 64),
-        Def(KeyEvent.KEYCODE_R, "R - Recarregar", "R\nRecarga", Tipo.TOQUE, 0.75f, 0.80f, 64),
-        Def(KeyEvent.KEYCODE_E, "E - Usar", "E\nUsar", Tipo.TOQUE, 0.70f, 0.30f, 64),
-        Def(KeyEvent.KEYCODE_B, "B - Comprar", "B\nComprar", Tipo.TOQUE, 0.50f, 0.10f, 64),
-        Def(KeyEvent.KEYCODE_Q, "Q - Trocar arma", "Q\nArma", Tipo.TOQUE, 0.60f, 0.90f, 64)
+        Def(JOY_ID, "Andar (joystick)", "Andar", Tipo.JOYSTICK, 0.15f, 0.65f, 120, 0),
+        Def(CAM_ID, "Mouse - Câmera (área de giro)", "CÂMERA", Tipo.CAMERA, 0.62f, 0.35f, 220, 0),
+        Def(TIRO_ID, "Tiro (segura)", "Tiro", Tipo.SEGURAR, 0.85f, 0.55f, 68, KeyEvent.KEYCODE_K),
+        Def(KeyEvent.KEYCODE_SPACE, "Pular", "Pular", Tipo.TOQUE, 0.92f, 0.40f, 64, KeyEvent.KEYCODE_SPACE),
+        Def(KeyEvent.KEYCODE_C, "Agachar", "Agachar", Tipo.TOQUE, 0.92f, 0.70f, 64, KeyEvent.KEYCODE_C),
+        Def(KeyEvent.KEYCODE_R, "Recarregar", "Recarga", Tipo.TOQUE, 0.75f, 0.80f, 64, KeyEvent.KEYCODE_R),
+        Def(KeyEvent.KEYCODE_E, "Usar", "Usar", Tipo.TOQUE, 0.70f, 0.30f, 64, KeyEvent.KEYCODE_E),
+        Def(KeyEvent.KEYCODE_B, "Comprar", "Comprar", Tipo.TOQUE, 0.50f, 0.10f, 64, KeyEvent.KEYCODE_B),
+        Def(KeyEvent.KEYCODE_Q, "Trocar arma", "Arma", Tipo.TOQUE, 0.60f, 0.90f, 64, KeyEvent.KEYCODE_X),
+        Def(DROP_ID, "Dropar item", "Dropar", Tipo.TOQUE, 0.40f, 0.90f, 64, KeyEvent.KEYCODE_Q),
+        Def(1002, "Botão extra 1", "Extra 1", Tipo.TOQUE, 0.30f, 0.20f, 64, KeyEvent.KEYCODE_1),
+        Def(1003, "Botão extra 2", "Extra 2", Tipo.TOQUE, 0.36f, 0.20f, 64, KeyEvent.KEYCODE_2),
+        Def(1004, "Botão extra 3", "Extra 3", Tipo.TOQUE, 0.42f, 0.20f, 64, KeyEvent.KEYCODE_3)
     )
 
     private val flagsBase = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -67,15 +77,25 @@ class TouchService : AccessibilityService() {
 
     private val ativos = LinkedHashMap<Int, Ativo>()
     private var selecionado: Ativo? = null
+
+    // teclas
+    private val teclas = HashMap<Int, Int>()
+    private val jTeclas = intArrayOf(
+        KeyEvent.KEYCODE_W, KeyEvent.KEYCODE_A, KeyEvent.KEYCODE_S, KeyEvent.KEYCODE_D
+    ) // cima, esquerda, baixo, direita
+    private val jNovo = IntArray(4)
+    private var jEtapa = 0
+    private val nomesEtapa = arrayOf("CIMA", "ESQUERDA", "BAIXO", "DIREITA")
+    private var esperando: Ativo? = null
+
+    // barra
     private var barra: LinearLayout? = null
+    private var linhaEdicao: LinearLayout? = null
     private var btnModo: TextView? = null
     private var btnAdd: TextView? = null
-    private var btnMenos: TextView? = null
-    private var btnMais: TextView? = null
-    private var btnRemover: TextView? = null
-    private var btnSensMenos: TextView? = null
-    private var btnSensMais: TextView? = null
     private var btnMouse: TextView? = null
+    private var lblSens: TextView? = null
+    private var btnTecla: TextView? = null
     private var painel: ScrollView? = null
 
     private var modoEdicao = false
@@ -95,8 +115,24 @@ class TouchService : AccessibilityService() {
     private var camAtiva = false
     private var offX = 0f
     private var offY = 0f
+    private var pendDx = 0f
+    private var pendDy = 0f
     private var sens = 1.5f
     private val soltarCamRun = Runnable { soltarCam() }
+
+    private val flushRun = object : Runnable {
+        override fun run() {
+            if (!capturando) return
+            if (pendDx != 0f || pendDy != 0f) {
+                val dx = pendDx
+                val dy = pendDy
+                pendDx = 0f
+                pendDy = 0f
+                moverCamera(dx, dy)
+            }
+            handler.postDelayed(this, 8)
+        }
+    }
 
     private inner class CapView(ctx: Context) : View(ctx) {
         override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
@@ -118,6 +154,12 @@ class TouchService : AccessibilityService() {
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         prefs = getSharedPreferences("mapeador", Context.MODE_PRIVATE)
         sens = prefs.getFloat("sens", 1.5f)
+        for (d in defs) {
+            teclas[d.id] = prefs.getInt("t_${d.id}", d.teclaPadrao)
+        }
+        for (i in 0 until 4) {
+            jTeclas[i] = prefs.getInt("jt_$i", jTeclas[i])
+        }
         criarBarra()
         for (def in defs) {
             if (prefs.getBoolean("on_${def.id}", false)) adicionar(def)
@@ -126,6 +168,31 @@ class TouchService : AccessibilityService() {
         val msg = Toques.preparar()
         if (msg != null) {
             Toast.makeText(this, "Mapeador: $msg", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    // ---------- nomes de teclas ----------
+
+    private fun nomeCurto(code: Int): String {
+        return when (code) {
+            KeyEvent.KEYCODE_SPACE -> "Espaço"
+            KeyEvent.KEYCODE_ENTER -> "Enter"
+            KeyEvent.KEYCODE_TAB -> "Tab"
+            KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT -> "Shift"
+            KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT -> "Ctrl"
+            KeyEvent.KEYCODE_ALT_LEFT, KeyEvent.KEYCODE_ALT_RIGHT -> "Alt"
+            else -> {
+                val s = KeyEvent.keyCodeToString(code).removePrefix("KEYCODE_")
+                if (s.startsWith("NUMPAD_")) "N" + s.removePrefix("NUMPAD_") else s.take(6)
+            }
+        }
+    }
+
+    private fun rotulo(def: Def): String {
+        return when (def.tipo) {
+            Tipo.JOYSTICK -> "Andar\n" + jTeclas.joinToString("") { nomeCurto(it) }
+            Tipo.CAMERA -> "CÂMERA"
+            else -> nomeCurto(teclas[def.id] ?: def.teclaPadrao) + "\n" + def.titulo
         }
     }
 
@@ -148,23 +215,41 @@ class TouchService : AccessibilityService() {
         }
     }
 
-    private fun criarBarra() {
-        val b = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val mb = pill("EDITAR") { alternarModo() }
-        val ma = pill("+ BOTÃO") { abrirPainel() }
-        val mm = pill("−") { redimensionar(-8) }
-        val mp = pill("+") { redimensionar(8) }
-        val mr = pill("REMOVER") { remover() }
-        val sm = pill("SENS −") { ajustarSens(-0.25f) }
-        val sp = pill("SENS +") { ajustarSens(0.25f) }
-        val mo = pill("MOUSE: OFF") { alternarCaptura() }
-        for (v in listOf(mb, ma, mm, mp, mr, sm, sp, mo)) {
+    private fun juntar(linha: LinearLayout, vararg vs: View) {
+        for (v in vs) {
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(5, 0, 5, 0) }
-            b.addView(v, lp)
+            ).apply { setMargins(5, 3, 5, 3) }
+            linha.addView(v, lp)
         }
+    }
+
+    private fun criarBarra() {
+        val coluna = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        val linha1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val linha2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+
+        val mb = pill("EDITAR") { alternarModo() }
+        val ma = pill("+ BOTÃO") { abrirPainel() }
+        val mo = pill("MOUSE: OFF") { alternarCaptura() }
+        val sm = pill("SENS −") { ajustarSens(-0.25f) }
+        val ls = pill("SENS 1.50") { }
+        val sp = pill("SENS +") { ajustarSens(0.25f) }
+        juntar(linha1, mb, ma, mo, sm, ls, sp)
+
+        val mm = pill("−") { redimensionar(-8) }
+        val mp = pill("+") { redimensionar(8) }
+        val mt = pill("TECLA") { iniciarEspera() }
+        val mr = pill("REMOVER") { remover() }
+        juntar(linha2, mm, mp, mt, mr)
+
+        coluna.addView(linha1)
+        coluna.addView(linha2)
+
         val wlp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -173,34 +258,29 @@ class TouchService : AccessibilityService() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = 8
+            y = 4
         }
-        wm.addView(b, wlp)
-        barra = b
+        wm.addView(coluna, wlp)
+        barra = coluna
+        linhaEdicao = linha2
         btnModo = mb
         btnAdd = ma
-        btnMenos = mm
-        btnMais = mp
-        btnRemover = mr
-        btnSensMenos = sm
-        btnSensMais = sp
         btnMouse = mo
+        lblSens = ls
+        btnTecla = mt
     }
 
     private fun atualizarBarra() {
         btnModo?.text = if (modoEdicao) "JOGAR" else "EDITAR"
         barra?.alpha = if (modoEdicao) 0.95f else 0.5f
         btnAdd?.visibility = if (modoEdicao) View.VISIBLE else View.GONE
-        val sel = selecionado
-        val vis = if (modoEdicao && sel != null) View.VISIBLE else View.GONE
-        btnMenos?.visibility = vis
-        btnMais?.visibility = vis
-        btnRemover?.visibility = vis
-        val visSens =
-            if (modoEdicao && sel?.def?.tipo == Tipo.CAMERA) View.VISIBLE else View.GONE
-        btnSensMenos?.visibility = visSens
-        btnSensMais?.visibility = visSens
         btnMouse?.visibility = if (modoEdicao) View.GONE else View.VISIBLE
+        lblSens?.text = "SENS " + "%.2f".format(sens)
+        val sel = selecionado
+        linhaEdicao?.visibility = if (modoEdicao && sel != null) View.VISIBLE else View.GONE
+        btnTecla?.visibility =
+            if (sel != null && sel.def.tipo != Tipo.CAMERA) View.VISIBLE else View.GONE
+        btnTecla?.text = if (esperando != null) "APERTE A TECLA..." else "TECLA"
         btnMouse?.text = when {
             !capturando -> "MOUSE: OFF"
             temCaptura -> "MOUSE: ON"
@@ -320,7 +400,7 @@ class TouchService : AccessibilityService() {
             setStroke(3, Color.WHITE)
         }
         val tv = TextView(this).apply {
-            text = def.rotulo
+            text = rotulo(def)
             setTextColor(Color.WHITE)
             textSize = tamTexto(dp)
             gravity = Gravity.CENTER
@@ -377,6 +457,7 @@ class TouchService : AccessibilityService() {
     }
 
     private fun selecionar(a: Ativo?) {
+        if (esperando != null && esperando !== a) esperando = null
         selecionado?.let { it.fundo.setStroke(3, Color.WHITE) }
         selecionado = a
         a?.fundo?.setStroke(7, Color.YELLOW)
@@ -403,6 +484,7 @@ class TouchService : AccessibilityService() {
     private fun remover() {
         val a = selecionado ?: return
         Toques.subir(a.def.id)
+        if (esperando === a) esperando = null
         if (a.def.id == JOY_ID) {
             joyAtivo = false
             cima = false
@@ -440,6 +522,7 @@ class TouchService : AccessibilityService() {
 
     private fun alternarModo() {
         modoEdicao = !modoEdicao
+        esperando = null
         if (modoEdicao) {
             desligarCaptura()
             soltarTudo()
@@ -465,7 +548,96 @@ class TouchService : AccessibilityService() {
     private fun ajustarSens(delta: Float) {
         sens = (sens + delta).coerceIn(0.25f, 6f)
         prefs.edit().putFloat("sens", sens).apply()
-        Toast.makeText(this, "Sensibilidade: " + "%.2f".format(sens), Toast.LENGTH_SHORT).show()
+        atualizarBarra()
+    }
+
+    // ---------- escolher tecla ----------
+
+    private fun iniciarEspera() {
+        val a = selecionado ?: return
+        if (!modoEdicao || a.def.tipo == Tipo.CAMERA) return
+        esperando = a
+        jEtapa = 0
+        atualizarBarra()
+        if (a.def.tipo == Tipo.JOYSTICK) {
+            avisarEtapa()
+        } else {
+            Toast.makeText(
+                this,
+                "Aperte a nova tecla para: ${a.def.titulo} (Esc cancela)",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    private fun avisarEtapa() {
+        Toast.makeText(
+            this,
+            "Andar: aperte a tecla para ${nomesEtapa[jEtapa]} (${jEtapa + 1}/4)",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    private fun conflito(tecla: Int, exceto: Int, jNovoAte: Int): String? {
+        for (d in defs) {
+            if (d.tipo == Tipo.JOYSTICK || d.tipo == Tipo.CAMERA) continue
+            if (d.id != exceto && teclas[d.id] == tecla) return d.titulo
+        }
+        if (exceto == JOY_ID) {
+            for (i in 0 until jNovoAte) {
+                if (jNovo[i] == tecla) return "Andar"
+            }
+        } else {
+            for (t in jTeclas) {
+                if (t == tecla) return "Andar"
+            }
+        }
+        return null
+    }
+
+    private fun finalizarEspera(a: Ativo) {
+        esperando = null
+        a.view.text = rotulo(a.def)
+        atualizarBarra()
+    }
+
+    private fun tratarEspera(code: Int) {
+        val a = esperando ?: return
+        if (code == KeyEvent.KEYCODE_ESCAPE) {
+            esperando = null
+            atualizarBarra()
+            Toast.makeText(this, "Cancelado", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (a.def.tipo == Tipo.JOYSTICK) {
+            val c = conflito(code, JOY_ID, jEtapa)
+            if (c != null) {
+                Toast.makeText(this, "Essa tecla já é de: $c", Toast.LENGTH_SHORT).show()
+                return
+            }
+            jNovo[jEtapa] = code
+            jEtapa++
+            if (jEtapa >= 4) {
+                val ed = prefs.edit()
+                for (i in 0 until 4) {
+                    jTeclas[i] = jNovo[i]
+                    ed.putInt("jt_$i", jNovo[i])
+                }
+                ed.apply()
+                finalizarEspera(a)
+            } else {
+                avisarEtapa()
+            }
+        } else {
+            val c = conflito(code, a.def.id, 0)
+            if (c != null) {
+                Toast.makeText(this, "Essa tecla já é de: $c", Toast.LENGTH_SHORT).show()
+                return
+            }
+            teclas[a.def.id] = code
+            prefs.edit().putInt("t_${a.def.id}", code).apply()
+            finalizarEspera(a)
+        }
     }
 
     // ---------- mouse ----------
@@ -478,6 +650,8 @@ class TouchService : AccessibilityService() {
     private fun ligarCaptura() {
         if (capView != null) return
         capturando = true
+        pendDx = 0f
+        pendDy = 0f
         val v = CapView(this)
         v.isFocusable = true
         v.isFocusableInTouchMode = true
@@ -497,6 +671,8 @@ class TouchService : AccessibilityService() {
         capView = v
         v.requestFocus()
         atualizarBarra()
+        handler.removeCallbacks(flushRun)
+        handler.post(flushRun)
         handler.postDelayed({ capView?.requestPointerCapture() }, 300)
         handler.postDelayed({
             if (capturando && !temCaptura) {
@@ -512,6 +688,9 @@ class TouchService : AccessibilityService() {
     private fun desligarCaptura() {
         capturando = false
         temCaptura = false
+        handler.removeCallbacks(flushRun)
+        pendDx = 0f
+        pendDy = 0f
         soltarCam()
         if (botaoEsq) {
             botaoEsq = false
@@ -539,15 +718,16 @@ class TouchService : AccessibilityService() {
                 dx += ev.getHistoricalX(i)
                 dy += ev.getHistoricalY(i)
             }
-            moverCamera(dx, dy)
+            pendDx += dx
+            pendDy += dy
         }
     }
 
     private fun atirarMouse(down: Boolean) {
-        val a = ativos[KeyEvent.KEYCODE_K] ?: return
+        val a = ativos[TIRO_ID] ?: return
         val c = centro(a)
-        if (down) Toques.descer(KeyEvent.KEYCODE_K, c.first, c.second)
-        else Toques.subir(KeyEvent.KEYCODE_K)
+        if (down) Toques.descer(TIRO_ID, c.first, c.second)
+        else Toques.subir(TIRO_ID)
     }
 
     private fun moverCamera(dx: Float, dy: Float) {
@@ -573,7 +753,7 @@ class TouchService : AccessibilityService() {
             Toques.mover(CAM_ID, c.first + offX, c.second + offY)
         }
         handler.removeCallbacks(soltarCamRun)
-        handler.postDelayed(soltarCamRun, 120)
+        handler.postDelayed(soltarCamRun, IDLE_MS)
     }
 
     private fun soltarCam() {
@@ -593,33 +773,48 @@ class TouchService : AccessibilityService() {
     override fun onKeyEvent(event: KeyEvent): Boolean {
         val down = event.action == KeyEvent.ACTION_DOWN
 
-        if (event.keyCode == KeyEvent.KEYCODE_F1) {
-            if (down && event.repeatCount == 0) alternarModo()
-            return true
-        }
-        if (event.keyCode == KeyEvent.KEYCODE_F2) {
-            if (down && event.repeatCount == 0) alternarCaptura()
-            return true
-        }
-        if (modoEdicao) return false
-
         when (event.keyCode) {
-            KeyEvent.KEYCODE_W, KeyEvent.KEYCODE_A,
-            KeyEvent.KEYCODE_S, KeyEvent.KEYCODE_D -> {
-                if (!ativos.containsKey(JOY_ID)) return false
-                when (event.keyCode) {
-                    KeyEvent.KEYCODE_W -> cima = down
-                    KeyEvent.KEYCODE_S -> baixo = down
-                    KeyEvent.KEYCODE_A -> esq = down
-                    KeyEvent.KEYCODE_D -> dir = down
-                }
-                atualizarJoystick()
+            KeyEvent.KEYCODE_F1 -> {
+                if (down && event.repeatCount == 0) alternarModo()
+                return true
+            }
+            KeyEvent.KEYCODE_F2 -> {
+                if (down && event.repeatCount == 0) alternarCaptura()
+                return true
+            }
+            KeyEvent.KEYCODE_F3 -> {
+                if (down) ajustarSens(-0.25f)
+                return true
+            }
+            KeyEvent.KEYCODE_F4 -> {
+                if (down) ajustarSens(0.25f)
                 return true
             }
         }
 
-        val a = ativos[event.keyCode] ?: return false
-        if (a.def.tipo == Tipo.JOYSTICK || a.def.tipo == Tipo.CAMERA) return false
+        if (esperando != null) {
+            if (down && event.repeatCount == 0) tratarEspera(event.keyCode)
+            return true
+        }
+        if (modoEdicao) return false
+
+        val ju = jTeclas.indexOf(event.keyCode)
+        if (ju >= 0 && ativos.containsKey(JOY_ID)) {
+            when (ju) {
+                0 -> cima = down
+                1 -> esq = down
+                2 -> baixo = down
+                3 -> dir = down
+            }
+            atualizarJoystick()
+            return true
+        }
+
+        val a = ativos.values.firstOrNull {
+            it.def.tipo != Tipo.JOYSTICK &&
+                    it.def.tipo != Tipo.CAMERA &&
+                    teclas[it.def.id] == event.keyCode
+        } ?: return false
         if (event.repeatCount > 0) return true
         val c = centro(a)
 
