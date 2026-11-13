@@ -2,6 +2,8 @@ package com.redfox.mapeador
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.hardware.display.DisplayManager
+import android.view.Display
 import rikka.shizuku.Shizuku
 import java.util.Locale
 
@@ -26,6 +28,52 @@ object Boost {
     fun salvarApps(ctx: Context, s: Set<String>) {
         sp(ctx).edit().putStringSet("apps", HashSet(s)).apply()
     }
+
+    // ---------- modo automático ----------
+
+    fun autoPkg(ctx: Context): String? = sp(ctx).getString("auto_pkg", null)
+
+    fun salvarAutoPkg(ctx: Context, pkg: String?) {
+        sp(ctx).edit().putString("auto_pkg", pkg).apply()
+    }
+
+    fun autoOn(ctx: Context): Boolean = sp(ctx).getBoolean("auto_on", false)
+
+    fun salvarAutoOn(ctx: Context, v: Boolean) {
+        sp(ctx).edit().putBoolean("auto_on", v).apply()
+    }
+
+    fun ligouAuto(ctx: Context): Boolean = sp(ctx).getBoolean("auto_ligou", false)
+
+    fun marcarLigouAuto(ctx: Context, v: Boolean) {
+        sp(ctx).edit().putBoolean("auto_ligou", v).apply()
+    }
+
+    fun maxHz(ctx: Context): Float {
+        return try {
+            val dm = ctx.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+            val d = dm.getDisplay(Display.DEFAULT_DISPLAY)
+            d.supportedModes.maxOf { it.refreshRate }
+        } catch (e: Throwable) {
+            60f
+        }
+    }
+
+    // liga com as opções que estão marcadas na tela do app
+    fun ligarSalvo(ctx: Context): String {
+        val ui = ctx.getSharedPreferences("boost_ui", Context.MODE_PRIVATE)
+        val hz = maxHz(ctx)
+        val taxa = if (ui.getBoolean("taxa", true) && hz > 61f) hz else 0f
+        return ligar(
+            ctx,
+            ui.getBoolean("fechar", true),
+            ui.getBoolean("dnd", true),
+            ui.getBoolean("anim", true),
+            taxa
+        )
+    }
+
+    // ---------- shizuku ----------
 
     private fun pronto(): String? {
         if (!Shizuku.pingBinder()) {
@@ -88,7 +136,6 @@ object Boost {
         val prefs = sp(ctx)
         val usaTaxa = taxaHz > 0f
 
-        // guarda o estado original ANTES de mudar qualquer coisa
         val ed = prefs.edit()
         if (dnd) ed.putString("o_zen", obter("global", "zen_mode"))
         if (anim) for (k in ANIM) ed.putString("o_$k", obter("global", k))
@@ -97,15 +144,18 @@ object Boost {
         ed.putBoolean("a_anim", anim)
         ed.putBoolean("a_taxa", usaTaxa)
         ed.putBoolean("ligado", true)
+        ed.putBoolean("auto_ligou", false)
         ed.commit()
 
         val r = StringBuilder("✅ Modo jogo ligado\n")
 
         if (fechar) {
             val lista = apps(ctx)
+            val jogo = autoPkg(ctx)
             var ok = 0
             for (pkg in lista) {
                 if (!PACOTE_OK.matches(pkg)) continue
+                if (pkg == jogo) continue
                 val (c, _) = shell("am force-stop $pkg")
                 if (c == 0) ok++
             }
@@ -177,7 +227,10 @@ object Boost {
             r.append("• Taxa de atualização: restaurada\n")
         }
 
-        prefs.edit().putBoolean("ligado", false).apply()
+        prefs.edit()
+            .putBoolean("ligado", false)
+            .putBoolean("auto_ligou", false)
+            .apply()
         r.append("• Os apps que foram fechados abrem normalmente quando você tocar neles.")
         return r.toString()
     }
