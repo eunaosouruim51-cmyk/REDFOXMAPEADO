@@ -1,22 +1,18 @@
 package com.redfox.mapeador
 
 import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.AccessibilityService.GestureResultCallback
-import android.accessibilityservice.GestureDescription
 import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Color
-import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
-import android.os.Handler
-import android.os.Looper
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.widget.TextView
+import android.widget.Toast
 import kotlin.math.sqrt
 
 class TouchService : AccessibilityService() {
@@ -35,19 +31,11 @@ class TouchService : AccessibilityService() {
         var params: WindowManager.LayoutParams? = null
     }
 
-    private class Dedo(var px: Float, var py: Float) {
-        var alvoX = px
-        var alvoY = py
-        var stroke: GestureDescription.StrokeDescription? = null
-        var soltar = false
-    }
-
     private val JOY_ID = -1
-    private val SEGMENTO = 60L
 
     private val botoes = listOf(
         Botao("WASD\nAndar", JOY_ID, Tipo.JOYSTICK, 0.15f, 0.65f, 120),
-        Botao("J\nTiro", KeyEvent.KEYCODE_J, Tipo.SEGURAR, 0.85f, 0.55f, 68),
+        Botao("K\nTiro", KeyEvent.KEYCODE_K, Tipo.SEGURAR, 0.85f, 0.55f, 68),
         Botao("Espaço\nPular", KeyEvent.KEYCODE_SPACE, Tipo.TOQUE, 0.92f, 0.40f, 68),
         Botao("C\nAgachar", KeyEvent.KEYCODE_C, Tipo.TOQUE, 0.92f, 0.70f, 68),
         Botao("R\nRecarga", KeyEvent.KEYCODE_R, Tipo.TOQUE, 0.75f, 0.80f, 68),
@@ -64,18 +52,15 @@ class TouchService : AccessibilityService() {
 
     private lateinit var wm: WindowManager
     private lateinit var prefs: SharedPreferences
-    private val handler = Handler(Looper.getMainLooper())
     private var menu: TextView? = null
     private var modoEdicao = true
     private var criado = false
 
-    // estado dos dedos virtuais
-    private val dedos = LinkedHashMap<Int, Dedo>()
-    private var emVoo = false
     private var cima = false
     private var baixo = false
     private var esq = false
     private var dir = false
+    private var joyAtivo = false
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -182,13 +167,24 @@ class TouchService : AccessibilityService() {
 
     private fun alternarModo() {
         modoEdicao = !modoEdicao
-        if (modoEdicao) soltarTudo()
+        if (modoEdicao) {
+            soltarTudo()
+        } else {
+            val msg = Toques.preparar()
+            if (msg != null) {
+                Toast.makeText(this, "Mapeador: $msg", Toast.LENGTH_LONG).show()
+            }
+        }
         aplicarModo()
     }
 
     private fun soltarTudo() {
-        cima = false; baixo = false; esq = false; dir = false
-        for (d in dedos.values) d.soltar = true
+        cima = false
+        baixo = false
+        esq = false
+        dir = false
+        joyAtivo = false
+        Toques.soltarTudo()
     }
 
     private fun aplicarModo() {
@@ -234,9 +230,9 @@ class TouchService : AccessibilityService() {
         val c = centro(b) ?: return true
 
         if (b.tipo == Tipo.SEGURAR) {
-            if (down) pressionar(b.id, c, false) else dedos[b.id]?.soltar = true
+            if (down) Toques.descer(b.id, c.first, c.second) else Toques.subir(b.id)
         } else if (down) {
-            pressionar(b.id, c, true)
+            Toques.tocar(b.id, c.first, c.second)
         }
         return true
     }
@@ -246,18 +242,6 @@ class TouchService : AccessibilityService() {
         val loc = IntArray(2)
         v.getLocationOnScreen(loc)
         return Pair(loc[0] + v.width / 2f, loc[1] + v.height / 2f)
-    }
-
-    private fun pressionar(id: Int, c: Pair<Float, Float>, soltarLogo: Boolean) {
-        val existente = dedos[id]
-        if (existente != null) {
-            if (!soltarLogo) existente.soltar = false
-        } else {
-            val d = Dedo(c.first, c.second)
-            d.soltar = soltarLogo
-            dedos[id] = d
-        }
-        iniciar()
     }
 
     private fun atualizarJoystick() {
@@ -270,7 +254,10 @@ class TouchService : AccessibilityService() {
         if (baixo) dy += 1f
 
         if (dx == 0f && dy == 0f) {
-            dedos[JOY_ID]?.soltar = true
+            if (joyAtivo) {
+                Toques.subir(JOY_ID)
+                joyAtivo = false
+            }
             return
         }
 
@@ -280,80 +267,16 @@ class TouchService : AccessibilityService() {
         val tx = c.first + dx / len * raio
         val ty = c.second + dy / len * raio
 
-        val d = dedos[JOY_ID]
-        if (d == null) {
-            val novo = Dedo(c.first, c.second)
-            novo.alvoX = tx
-            novo.alvoY = ty
-            dedos[JOY_ID] = novo
-        } else {
-            d.alvoX = tx
-            d.alvoY = ty
-            d.soltar = false
+        if (!joyAtivo) {
+            Toques.descer(JOY_ID, c.first, c.second)
+            joyAtivo = true
         }
-        iniciar()
-    }
-
-    private fun iniciar() {
-        if (!emVoo) proximoSegmento()
-    }
-
-    private val callback = object : GestureResultCallback() {
-        override fun onCompleted(gestureDescription: GestureDescription?) {
-            emVoo = false
-            if (dedos.isNotEmpty()) proximoSegmento()
-        }
-
-        override fun onCancelled(gestureDescription: GestureDescription?) {
-            emVoo = false
-            dedos.entries.removeAll { it.value.soltar }
-            for (d in dedos.values) d.stroke = null
-            if (dedos.isNotEmpty()) {
-                handler.postDelayed({ if (!emVoo) proximoSegmento() }, 50)
-            }
-        }
-    }
-
-    private fun proximoSegmento() {
-        if (dedos.isEmpty()) return
-        val gb = GestureDescription.Builder()
-        val fim = mutableListOf<Int>()
-        val max = GestureDescription.getMaxStrokeCount()
-        var n = 0
-
-        for ((id, d) in dedos) {
-            if (n >= max) break
-            val path = Path().apply {
-                moveTo(d.px, d.py)
-                if (d.px != d.alvoX || d.py != d.alvoY) lineTo(d.alvoX, d.alvoY)
-            }
-            val continua = !d.soltar
-            val anterior = d.stroke
-            val s = if (anterior == null) {
-                GestureDescription.StrokeDescription(path, 0L, SEGMENTO, continua)
-            } else {
-                anterior.continueStroke(path, 0L, SEGMENTO, continua)
-            }
-            gb.addStroke(s)
-            d.stroke = s
-            d.px = d.alvoX
-            d.py = d.alvoY
-            n++
-            if (d.soltar) fim.add(id)
-        }
-        for (id in fim) dedos.remove(id)
-
-        emVoo = true
-        val ok = dispatchGesture(gb.build(), callback, null)
-        if (!ok) {
-            emVoo = false
-            dedos.clear()
-        }
+        Toques.mover(JOY_ID, tx, ty)
     }
 
     override fun onDestroy() {
         if (criado) {
-            dedos.clear()
+            Toques.soltarTudo()
             for (b in botoes) {
                 b.view?.let {
                     try { wm.removeView(it) } catch (e: Exception) {}
