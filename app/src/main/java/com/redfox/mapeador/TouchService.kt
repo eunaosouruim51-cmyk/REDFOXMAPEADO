@@ -2,7 +2,9 @@ package com.redfox.mapeador
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
@@ -21,6 +23,11 @@ import android.widget.Toast
 import kotlin.math.sqrt
 
 class TouchService : AccessibilityService() {
+
+    companion object {
+        @Volatile
+        var instance: TouchService? = null
+    }
 
     private enum class Tipo { TOQUE, SEGURAR, JOYSTICK, CAMERA, DESLIZAR }
 
@@ -47,8 +54,11 @@ class TouchService : AccessibilityService() {
     private val SWIPE_ID = -3
     private val TIRO_ID = KeyEvent.KEYCODE_K
     private val IDLE_MS = 350L
+    private val J_PADRAO = intArrayOf(
+        KeyEvent.KEYCODE_W, KeyEvent.KEYCODE_A, KeyEvent.KEYCODE_S, KeyEvent.KEYCODE_D
+    )
+    private val nomesModo = arrayOf("toque", "segura", "alterna")
 
-    // botões especiais (só um de cada)
     private val especiais = listOf(
         Def(JOY_ID, "Andar (joystick)", "Andar", Tipo.JOYSTICK, 0.15f, 0.65f, 120),
         Def(CAM_ID, "Mouse - Câmera (área de giro)", "CÂMERA", Tipo.CAMERA, 0.62f, 0.35f, 220),
@@ -56,7 +66,6 @@ class TouchService : AccessibilityService() {
         Def(SWIPE_ID, "Trocar arma (deslizar)", "Arma", Tipo.DESLIZAR, 0.80f, 0.12f, 100)
     )
 
-    // botões de tecla criados por você (quantos quiser)
     private val genericos = LinkedHashMap<Int, Def>()
 
     private val flagsBase = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -64,7 +73,9 @@ class TouchService : AccessibilityService() {
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
 
     private lateinit var wm: WindowManager
+    private lateinit var meta: SharedPreferences
     private lateinit var prefs: SharedPreferences
+    private var perfilId = "mapeador"
     private val handler = Handler(Looper.getMainLooper())
 
     private val ativos = LinkedHashMap<Int, Ativo>()
@@ -72,10 +83,9 @@ class TouchService : AccessibilityService() {
 
     // teclas
     private val teclas = HashMap<Int, Int>()
-    // cima, esquerda, baixo, direita
-    private val jTeclas = intArrayOf(
-        KeyEvent.KEYCODE_W, KeyEvent.KEYCODE_A, KeyEvent.KEYCODE_S, KeyEvent.KEYCODE_D
-    )
+    private val modos = HashMap<Int, Int>()
+    private val alternados = HashSet<Int>()
+    private val jTeclas = IntArray(4)
     private val sTeclas = IntArray(4)
     private val gNovo = IntArray(4)
     private var gEtapa = 0
@@ -90,10 +100,14 @@ class TouchService : AccessibilityService() {
     private var btnMouse: TextView? = null
     private var lblSens: TextView? = null
     private var btnTecla: TextView? = null
+    private var btnTipo: TextView? = null
+    private var btnPerfil: TextView? = null
+    private var lblAlfa: TextView? = null
     private var painel: ScrollView? = null
 
     private var modoEdicao = false
     private var criado = false
+    private var alfa = 0.3f
 
     private var cima = false
     private var baixo = false
@@ -101,6 +115,10 @@ class TouchService : AccessibilityService() {
     private var dir = false
     private var joyAtivo = false
     private var deslizando = false
+
+    // modo jogo automático
+    private var boostOcupado = false
+    private var launcherPkg: String? = null
 
     // mouse
     private var capView: View? = null
@@ -146,31 +164,127 @@ class TouchService : AccessibilityService() {
         super.onServiceConnected()
         if (criado) return
         criado = true
+        instance = this
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        prefs = getSharedPreferences("mapeador", Context.MODE_PRIVATE)
+        meta = getSharedPreferences("meta", Context.MODE_PRIVATE)
+        criarBarra()
+        carregarPerfil()
+        val msg = Toques.preparar()
+        if (msg != null) {
+            Toast.makeText(this, "Mapeador: $msg", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    // ---------- perfis ----------
+
+    private fun listaPerfis(): MutableList<String> {
+        val s = meta.getString("perfis", "") ?: ""
+        val l = s.split(",").filter { it.isNotEmpty() }.toMutableList()
+        if (l.isEmpty()) l.add("mapeador")
+        return l
+    }
+
+    private fun salvarPerfis(l: List<String>) {
+        meta.edit().putString("perfis", l.joinToString(",")).apply()
+    }
+
+    private fun nomePerfil(id: String): String {
+        return meta.getString("nome_$id", null) ?: if (id == "mapeador") "Padrão" else id
+    }
+
+    private fun copiar(de: SharedPreferences, para: SharedPreferences) {
+        val ed = para.edit()
+        ed.clear()
+        for ((k, v) in de.all) {
+            when (v) {
+                is Boolean -> ed.putBoolean(k, v)
+                is Int -> ed.putInt(k, v)
+                is Float -> ed.putFloat(k, v)
+                is Long -> ed.putLong(k, v)
+                is String -> ed.putString(k, v)
+            }
+        }
+        ed.commit()
+    }
+
+    fun recarregar() {
+        if (criado) carregarPerfil()
+    }
+
+    private fun carregarPerfil() {
+        soltarTudo()
+        desligarCaptura()
+        fecharPainel()
+        esperando = null
+        for (a in ativos.values) {
+            try { wm.removeView(a.view) } catch (e: Exception) {}
+        }
+        ativos.clear()
+        genericos.clear()
+        teclas.clear()
+        modos.clear()
+        alternados.clear()
+        selecionado = null
+
+        val lista = listaPerfis()
+        var id = meta.getString("atual", null) ?: "mapeador"
+        if (!lista.contains(id)) id = lista[0]
+        perfilId = id
+        prefs = getSharedPreferences(perfilId, Context.MODE_PRIVATE)
+
         sens = prefs.getFloat("sens", 1.5f)
+        alfa = prefs.getFloat("alfa", 0.3f)
         for (i in 0 until 4) {
-            jTeclas[i] = prefs.getInt("jt_$i", jTeclas[i])
+            jTeclas[i] = prefs.getInt("jt_$i", J_PADRAO[i])
             sTeclas[i] = prefs.getInt("st_$i", 0)
         }
 
-        val lista = prefs.getString("gen", "") ?: ""
-        for (s in lista.split(",")) {
-            val id = s.toIntOrNull() ?: continue
-            genericos[id] = Def(id, "Botão de tecla", "", Tipo.TOQUE, 0.5f, 0.5f, 64)
+        val gen = prefs.getString("gen", "") ?: ""
+        for (s in gen.split(",")) {
+            val gid = s.toIntOrNull() ?: continue
+            genericos[gid] = Def(gid, "Botão de tecla", "", Tipo.TOQUE, 0.5f, 0.5f, 64)
         }
         migrar()
 
-        criarBarra()
         for (def in especiais) {
             if (prefs.getBoolean("on_${def.id}", false)) adicionar(def)
         }
         for (def in genericos.values) adicionar(def)
         aplicarModo()
-        val msg = Toques.preparar()
-        if (msg != null) {
-            Toast.makeText(this, "Mapeador: $msg", Toast.LENGTH_LONG).show()
-        }
+    }
+
+    private fun trocarPerfil(id: String) {
+        meta.edit().putString("atual", id).apply()
+        carregarPerfil()
+        Toast.makeText(this, "Perfil: " + nomePerfil(id), Toast.LENGTH_SHORT).show()
+    }
+
+    private fun novoPerfil(duplicar: Boolean) {
+        val n = meta.getInt("perfil_next", 2)
+        meta.edit().putInt("perfil_next", n + 1).apply()
+        val id = "perfil_$n"
+        val nome = if (duplicar) nomePerfil(perfilId) + " (cópia)" else "Perfil $n"
+        val novo = getSharedPreferences(id, Context.MODE_PRIVATE)
+        if (duplicar) copiar(prefs, novo)
+        val l = listaPerfis()
+        l.add(id)
+        salvarPerfis(l)
+        meta.edit().putString("nome_$id", nome).putString("atual", id).apply()
+        carregarPerfil()
+        Toast.makeText(this, "Perfil criado: $nome", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun apagarPerfil() {
+        val l = listaPerfis()
+        if (l.size <= 1) return
+        val id = perfilId
+        l.remove(id)
+        salvarPerfis(l)
+        meta.edit().remove("nome_$id").putString("atual", l[0]).apply()
+        prefs.edit().clear().commit()
+        carregarPerfil()
+        deleteSharedPreferences(id)
+        Toast.makeText(this, "Perfil apagado", Toast.LENGTH_SHORT).show()
     }
 
     // ---------- botões genéricos ----------
@@ -192,7 +306,7 @@ class TouchService : AccessibilityService() {
         return def
     }
 
-    // traz os botões da versão anterior (pré-definidos) para botões de tecla
+    // traz os botões da versão antiga (pré-definidos) para botões de tecla
     private fun migrar() {
         if (prefs.getBoolean("mig2", false)) return
         val antigos = listOf(
@@ -238,6 +352,11 @@ class TouchService : AccessibilityService() {
         }
     }
 
+    private fun nomeTecla(id: Int): String {
+        val k = teclas[id] ?: 0
+        return if (k == 0) "?" else nomeCurto(k)
+    }
+
     private fun rotulo(def: Def): String {
         return when (def.tipo) {
             Tipo.JOYSTICK -> "Andar\n" + jTeclas.joinToString("") { nomeCurto(it) }
@@ -250,11 +369,8 @@ class TouchService : AccessibilityService() {
                 }
                 "Arma\n" + (if (partes.isEmpty()) "sem tecla" else partes.joinToString(" "))
             }
-            else -> {
-                val k = teclas[def.id] ?: 0
-                val nome = if (k == 0) "?" else nomeCurto(k)
-                if (def.titulo.isEmpty()) nome else nome + "\n" + def.titulo
-            }
+            Tipo.SEGURAR -> nomeTecla(def.id) + "\n" + def.titulo
+            Tipo.TOQUE -> nomeTecla(def.id) + "\n" + nomesModo[modos[def.id] ?: 0]
         }
     }
 
@@ -294,6 +410,7 @@ class TouchService : AccessibilityService() {
         }
         val linha1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val linha2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val linha3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
 
         val mb = pill("EDITAR") { alternarModo() }
         val ma = pill("+ BOTÃO") { abrirPainel() }
@@ -306,11 +423,19 @@ class TouchService : AccessibilityService() {
         val mm = pill("−") { redimensionar(-8) }
         val mp = pill("+") { redimensionar(8) }
         val mt = pill("TECLA") { iniciarEspera() }
+        val md = pill("MODO: TOQUE") { ciclarModo() }
         val mr = pill("REMOVER") { remover() }
-        juntar(linha2, mm, mp, mt, mr)
+        juntar(linha2, mm, mp, mt, md, mr)
+
+        val pf = pill("PERFIL") { abrirPainelPerfis() }
+        val tm = pill("TRANSP −") { ajustarAlfa(-0.05f) }
+        val tl = pill("TRANSP 30%") { }
+        val tp = pill("TRANSP +") { ajustarAlfa(0.05f) }
+        juntar(linha3, pf, tm, tl, tp)
 
         coluna.addView(linha1)
         coluna.addView(linha2)
+        coluna.addView(linha3)
 
         val wlp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -330,6 +455,9 @@ class TouchService : AccessibilityService() {
         btnMouse = mo
         lblSens = ls
         btnTecla = mt
+        btnTipo = md
+        btnPerfil = pf
+        lblAlfa = tl
     }
 
     private fun atualizarBarra() {
@@ -338,11 +466,20 @@ class TouchService : AccessibilityService() {
         btnAdd?.visibility = if (modoEdicao) View.VISIBLE else View.GONE
         btnMouse?.visibility = if (modoEdicao) View.GONE else View.VISIBLE
         lblSens?.text = "SENS " + "%.2f".format(sens)
+        lblAlfa?.text = "TRANSP " + Math.round(alfa * 100f) + "%"
+        btnPerfil?.text = "PERFIL: " + nomePerfil(perfilId)
+
         val sel = selecionado
         linhaEdicao?.visibility = if (modoEdicao && sel != null) View.VISIBLE else View.GONE
         btnTecla?.visibility =
             if (sel != null && sel.def.tipo != Tipo.CAMERA) View.VISIBLE else View.GONE
         btnTecla?.text = if (esperando != null) "APERTE A TECLA..." else "TECLA"
+        if (sel != null && sel.def.tipo == Tipo.TOQUE) {
+            btnTipo?.visibility = View.VISIBLE
+            btnTipo?.text = "MODO: " + nomesModo[modos[sel.def.id] ?: 0].uppercase()
+        } else {
+            btnTipo?.visibility = View.GONE
+        }
         btnMouse?.text = when {
             !capturando -> "MOUSE: OFF"
             temCaptura -> "MOUSE: ON"
@@ -350,68 +487,51 @@ class TouchService : AccessibilityService() {
         }
     }
 
-    private fun abrirPainel() {
-        if (!modoEdicao) return
-        fecharPainel()
-        val dens = resources.displayMetrics.density
-        val d = resources.displayMetrics
-        val alt = minOf(d.widthPixels, d.heightPixels)
+    // ---------- painéis ----------
 
-        val lista = LinearLayout(this).apply {
+    private fun itemPainel(texto: String, cor: String, acao: () -> Unit): TextView {
+        return TextView(this).apply {
+            text = texto
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(24, 24, 24, 24)
+            background = GradientDrawable().apply {
+                cornerRadius = 24f
+                setColor(Color.parseColor(cor))
+            }
+            setOnClickListener { acao() }
+        }
+    }
+
+    private fun novaLista(titulo: String): LinearLayout {
+        val l = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(24, 24, 24, 24)
         }
-
-        fun item(texto: String, cor: String, acao: () -> Unit): TextView {
-            return TextView(this).apply {
-                text = texto
-                textSize = 14f
-                setTextColor(Color.WHITE)
-                gravity = Gravity.CENTER
-                setPadding(24, 24, 24, 24)
-                background = GradientDrawable().apply {
-                    cornerRadius = 24f
-                    setColor(Color.parseColor(cor))
-                }
-                setOnClickListener { acao() }
-            }
-        }
-
-        fun addItem(v: View) {
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 0, 0, 12) }
-            lista.addView(v, lp)
-        }
-
-        val titulo = TextView(this).apply {
-            text = "Toque para colocar na tela"
+        val t = TextView(this).apply {
+            text = titulo
             textSize = 13f
             setTextColor(Color.LTGRAY)
             gravity = Gravity.CENTER
             setPadding(0, 0, 0, 16)
         }
-        lista.addView(titulo)
+        l.addView(t)
+        return l
+    }
 
-        addItem(item("+ Botão de tecla (pode repetir)", "#FF1565C0") {
-            val def = novoGenerico()
-            adicionar(def)
-            selecionar(ativos[def.id])
-            fecharPainel()
-            iniciarEspera()
-        })
+    private fun addNaLista(l: LinearLayout, v: View) {
+        val lp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(0, 0, 0, 12) }
+        l.addView(v, lp)
+    }
 
-        for (def in especiais.filter { !ativos.containsKey(it.id) }) {
-            addItem(item(def.nome, "#FF37474F") {
-                adicionar(def)
-                selecionar(ativos[def.id])
-                fecharPainel()
-                if (def.tipo == Tipo.DESLIZAR) iniciarEspera()
-            })
-        }
-        addItem(item("FECHAR", "#FF37474F") { fecharPainel() })
-
+    private fun mostrarPainel(lista: LinearLayout) {
+        val dens = resources.displayMetrics.density
+        val d = resources.displayMetrics
+        val alt = minOf(d.widthPixels, d.heightPixels)
         val sv = ScrollView(this).apply {
             background = GradientDrawable().apply {
                 cornerRadius = 32f
@@ -438,6 +558,66 @@ class TouchService : AccessibilityService() {
         painel = null
     }
 
+    private fun abrirPainel() {
+        if (!modoEdicao) return
+        fecharPainel()
+        val lista = novaLista("Toque para colocar na tela")
+
+        addNaLista(lista, itemPainel("+ Botão de tecla (pode repetir)", "#FF1565C0") {
+            val def = novoGenerico()
+            adicionar(def)
+            selecionar(ativos[def.id])
+            fecharPainel()
+            iniciarEspera()
+        })
+
+        for (def in especiais.filter { !ativos.containsKey(it.id) }) {
+            addNaLista(lista, itemPainel(def.nome, "#FF37474F") {
+                adicionar(def)
+                selecionar(ativos[def.id])
+                fecharPainel()
+                if (def.tipo == Tipo.DESLIZAR) iniciarEspera()
+            })
+        }
+        addNaLista(lista, itemPainel("FECHAR", "#FF37474F") { fecharPainel() })
+        mostrarPainel(lista)
+    }
+
+    private fun abrirPainelPerfis() {
+        fecharPainel()
+        val lista = novaLista("Perfis (toque para trocar)")
+        val ids = listaPerfis()
+        for (id in ids) {
+            val atual = id == perfilId
+            addNaLista(
+                lista,
+                itemPainel(
+                    (if (atual) "● " else "") + nomePerfil(id),
+                    if (atual) "#FF1565C0" else "#FF37474F"
+                ) {
+                    if (atual) fecharPainel() else trocarPerfil(id)
+                }
+            )
+        }
+        addNaLista(lista, itemPainel("+ Novo perfil (vazio)", "#FF2E7D32") { novoPerfil(false) })
+        addNaLista(lista, itemPainel("Duplicar o perfil atual", "#FF2E7D32") { novoPerfil(true) })
+        if (ids.size > 1) {
+            var confirma = false
+            val apagar = itemPainel("Apagar o perfil atual", "#FF8E2424") {}
+            apagar.setOnClickListener {
+                if (!confirma) {
+                    confirma = true
+                    apagar.text = "TOQUE DE NOVO PARA APAGAR"
+                } else {
+                    apagarPerfil()
+                }
+            }
+            addNaLista(lista, apagar)
+        }
+        addNaLista(lista, itemPainel("FECHAR", "#FF37474F") { fecharPainel() })
+        mostrarPainel(lista)
+    }
+
     // ---------- botões ----------
 
     private fun tamTexto(dp: Int, tipo: Tipo): Float {
@@ -452,6 +632,9 @@ class TouchService : AccessibilityService() {
                 "t_${def.id}",
                 if (def.id == TIRO_ID) KeyEvent.KEYCODE_K else 0
             )
+        }
+        if (def.tipo == Tipo.TOQUE) {
+            modos[def.id] = prefs.getInt("m_${def.id}", 0)
         }
         val d = resources.displayMetrics
         val larg = maxOf(d.widthPixels, d.heightPixels)
@@ -552,6 +735,23 @@ class TouchService : AccessibilityService() {
         salvar(a)
     }
 
+    private fun ciclarModo() {
+        val a = selecionado ?: return
+        if (a.def.tipo != Tipo.TOQUE) return
+        val novo = ((modos[a.def.id] ?: 0) + 1) % 3
+        modos[a.def.id] = novo
+        prefs.edit().putInt("m_${a.def.id}", novo).apply()
+        a.view.text = rotulo(a.def)
+        atualizarBarra()
+    }
+
+    private fun ajustarAlfa(delta: Float) {
+        alfa = (Math.round((alfa + delta) * 20f) / 20f).coerceIn(0.05f, 1f)
+        prefs.edit().putFloat("alfa", alfa).apply()
+        for (a in ativos.values) aplicarEstado(a)
+        atualizarBarra()
+    }
+
     private fun remover() {
         val a = selecionado ?: return
         val id = a.def.id
@@ -577,9 +777,11 @@ class TouchService : AccessibilityService() {
         if (genericos.containsKey(id)) {
             genericos.remove(id)
             teclas.remove(id)
+            modos.remove(id)
+            alternados.remove(id)
             prefs.edit()
                 .remove("on_$id").remove("x_$id").remove("y_$id")
-                .remove("s_$id").remove("t_$id")
+                .remove("s_$id").remove("t_$id").remove("m_$id")
                 .apply()
             salvarListaGen()
         } else {
@@ -595,7 +797,8 @@ class TouchService : AccessibilityService() {
             a.view.alpha = 0.9f
         } else {
             a.params.flags = flagsBase or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-            a.view.alpha = if (a.def.tipo == Tipo.CAMERA) 0.12f else 0.3f
+            a.view.alpha =
+                if (a.def.tipo == Tipo.CAMERA) (alfa * 0.4f).coerceAtLeast(0.05f) else alfa
         }
         wm.updateViewLayout(a.view, a.params)
     }
@@ -631,6 +834,7 @@ class TouchService : AccessibilityService() {
         dir = false
         joyAtivo = false
         deslizando = false
+        alternados.clear()
         soltarCam()
         Toques.soltarTudo()
     }
@@ -898,11 +1102,54 @@ class TouchService : AccessibilityService() {
         }
     }
 
-    // ---------- teclado ----------
+    // ---------- modo jogo automático ----------
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    private fun launcher(): String? {
+        if (launcherPkg == null) {
+            val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+            launcherPkg = packageManager
+                .resolveActivity(i, PackageManager.MATCH_DEFAULT_ONLY)
+                ?.activityInfo?.packageName
+        }
+        return launcherPkg
+    }
+
+    private fun rodarBoost(ligar: Boolean) {
+        boostOcupado = true
+        Thread {
+            val msg = if (ligar) {
+                val r = Boost.ligarSalvo(this)
+                if (Boost.ligado(this)) Boost.marcarLigouAuto(this, true)
+                r
+            } else {
+                Boost.desligar(this)
+            }
+            handler.post {
+                val titulo = if (ligar) "Modo jogo automático" else "Saiu do jogo"
+                Toast.makeText(this, "$titulo\n$msg", Toast.LENGTH_LONG).show()
+                boostOcupado = false
+            }
+        }.start()
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        val pkg = event.packageName?.toString() ?: return
+        if (pkg == packageName || boostOcupado) return
+        val jogo = Boost.autoPkg(this) ?: return
+        if (!Boost.autoOn(this)) return
+
+        if (pkg == jogo) {
+            if (!Boost.ligado(this)) rodarBoost(true)
+        } else if (pkg == launcher() && Boost.ligado(this) && Boost.ligouAuto(this)) {
+            rodarBoost(false)
+        }
+    }
 
     override fun onInterrupt() {}
+
+    // ---------- teclado ----------
 
     override fun onKeyEvent(event: KeyEvent): Boolean {
         val down = event.action == KeyEvent.ACTION_DOWN
@@ -958,11 +1205,26 @@ class TouchService : AccessibilityService() {
         } ?: return false
         if (event.repeatCount > 0) return true
         val c = centro(a)
+        val modo = if (a.def.tipo == Tipo.SEGURAR) 1 else (modos[a.def.id] ?: 0)
 
-        if (a.def.tipo == Tipo.SEGURAR) {
-            if (down) Toques.descer(a.def.id, c.first, c.second) else Toques.subir(a.def.id)
-        } else if (down) {
-            Toques.tocar(a.def.id, c.first, c.second)
+        when (modo) {
+            1 -> {
+                if (down) Toques.descer(a.def.id, c.first, c.second)
+                else Toques.subir(a.def.id)
+            }
+            2 -> {
+                if (down) {
+                    if (alternados.remove(a.def.id)) {
+                        Toques.subir(a.def.id)
+                    } else {
+                        alternados.add(a.def.id)
+                        Toques.descer(a.def.id, c.first, c.second)
+                    }
+                }
+            }
+            else -> {
+                if (down) Toques.tocar(a.def.id, c.first, c.second)
+            }
         }
         return true
     }
@@ -1005,6 +1267,7 @@ class TouchService : AccessibilityService() {
 
     override fun onDestroy() {
         if (criado) {
+            instance = null
             desligarCaptura()
             Toques.soltarTudo()
             fecharPainel()
